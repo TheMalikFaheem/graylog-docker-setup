@@ -1,0 +1,179 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graylog Stack — Docker Compose
+# Includes: MongoDB 6, OpenSearch 2, and Graylog 5
+#
+# BEFORE STARTING:
+#   1. Copy .env.example to .env and fill in your values.
+#   2. Generate a password secret:
+#        pwgen -N 1 -s 96
+#   3. Generate the root password SHA2:
+#        echo -n "YourAdminPassword" | sha256sum
+#   4. Set vm.max_map_count for OpenSearch:
+#        sudo sysctl -w vm.max_map_count=262144
+#        (Add to /etc/sysctl.conf for persistence)
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  graylog-net:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+    driver: local
+  opensearch_data:
+    driver: local
+  graylog_data:
+    driver: local
+  graylog_journal:
+    driver: local
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # MongoDB — Graylog metadata store
+  # ──────────────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:6.0
+    container_name: graylog-mongodb
+    restart: unless-stopped
+    networks:
+      - graylog-net
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-graylog}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-graylogpassword}
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # OpenSearch — Graylog search & indexing backend
+  # ──────────────────────────────────────────────────────────────────────────
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: graylog-opensearch
+    restart: unless-stopped
+    networks:
+      - graylog-net
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    environment:
+      - cluster.name=graylog-cluster
+      - node.name=graylog-opensearch
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - DISABLE_SECURITY_PLUGIN=true        # Disable TLS for internal comms
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Graylog — Log management server
+  # ──────────────────────────────────────────────────────────────────────────
+  graylog:
+    image: graylog/graylog:5.2
+    container_name: graylog-server
+    restart: unless-stopped
+    networks:
+      - graylog-net
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    volumes:
+      - graylog_data:/usr/share/graylog/data
+      - graylog_journal:/usr/share/graylog/data/journal
+    environment:
+      # ── Core Settings ──────────────────────────────────────────────────
+      GRAYLOG_IS_MASTER: "true"
+      GRAYLOG_NODE_ID_FILE: "/usr/share/graylog/data/config/node-id"
+
+      # ── Security (REQUIRED — replace before production use) ────────────
+      # Generate with: pwgen -N 1 -s 96
+      GRAYLOG_PASSWORD_SECRET: ${GRAYLOG_PASSWORD_SECRET:-replacethiswithatleast64characterlongrandomsecretstringforproduction}
+
+      # SHA256 of your desired admin password
+      # Generate with: echo -n "admin" | sha256sum
+      GRAYLOG_ROOT_PASSWORD_SHA2: ${GRAYLOG_ROOT_PASSWORD_SHA2:-8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918}
+
+      # ── Web UI ─────────────────────────────────────────────────────────
+      GRAYLOG_HTTP_BIND_ADDRESS: "0.0.0.0:9000"
+      GRAYLOG_HTTP_EXTERNAL_URI: ${GRAYLOG_HTTP_EXTERNAL_URI:-http://localhost:9000/}
+
+      # ── Database ───────────────────────────────────────────────────────
+      GRAYLOG_MONGODB_URI: mongodb://${MONGO_ROOT_USER:-graylog}:${MONGO_ROOT_PASSWORD:-graylogpassword}@mongodb:27017/graylog?authSource=admin
+
+      # ── Search Backend ─────────────────────────────────────────────────
+      GRAYLOG_ELASTICSEARCH_HOSTS: http://opensearch:9200
+
+      # ── Timezone ───────────────────────────────────────────────────────
+      GRAYLOG_ROOT_TIMEZONE: ${GRAYLOG_TIMEZONE:-UTC}
+
+      # ── Email (Optional — configure for alerts) ─────────────────────────
+      GRAYLOG_TRANSPORT_EMAIL_ENABLED: "false"
+      # GRAYLOG_TRANSPORT_EMAIL_HOSTNAME: smtp.example.com
+      # GRAYLOG_TRANSPORT_EMAIL_PORT: 587
+      # GRAYLOG_TRANSPORT_EMAIL_USE_AUTH: "true"
+      # GRAYLOG_TRANSPORT_EMAIL_USE_TLS: "true"
+      # GRAYLOG_TRANSPORT_EMAIL_AUTH_USERNAME: alerts@example.com
+      # GRAYLOG_TRANSPORT_EMAIL_AUTH_PASSWORD: yourpassword
+      # GRAYLOG_TRANSPORT_EMAIL_FROM_EMAIL: alerts@example.com
+
+    ports:
+      # ── Web UI ──────────────────────────────────────────────────────────
+      - "9000:9000"
+
+      # ── Syslog UDP/TCP ──────────────────────────────────────────────────
+      - "514:514/udp"
+      - "514:514/tcp"
+
+      # ── GELF (Graylog Extended Log Format) ─────────────────────────────
+      - "12201:12201"
+      - "12201:12201/udp"
+
+      # ── Raw/Plaintext TCP ────────────────────────────────────────────────
+      - "5555:5555"
+
+      # ── Beats (Filebeat/Metricbeat) ─────────────────────────────────────
+      - "5044:5044"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9000/api/system/lbstatus | grep -q 'ALIVE'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
